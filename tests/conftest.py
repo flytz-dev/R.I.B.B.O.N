@@ -4,9 +4,8 @@ import os
 import tempfile
 
 # Always isolate tests, even when the developer configured a production database.
-os.environ["PYCONFER_DB"] = os.path.join(
-    tempfile.mkdtemp(prefix="pyconfer_tests_"), "history.db"
-)
+_TEST_DATABASE = os.path.join(tempfile.mkdtemp(prefix="ribbon_tests_"), "history.db")
+os.environ["RIBBON_DB"] = os.environ["PYCONFER_DB"] = _TEST_DATABASE
 
 import pytest  # noqa: E402 (configure the test database before importing)
 
@@ -18,6 +17,6 @@ def clean_history():
     """Clear temporary history between tests without deleting an open SQLite file."""
     storage.create_schema()
     with storage._connection() as connection:
-        connection.execute("DELETE FROM page")
-        connection.execute("DELETE FROM audit")
+        for table in ("page", "missing_slip", "audit", "session", "app_user"):
+            connection.execute(f"DELETE FROM {table}")
     yield

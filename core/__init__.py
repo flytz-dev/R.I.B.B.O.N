@@ -1,1 +1,1 @@
-"""PyConfer OCR, consensus, and verification core."""
+"""RIBBON OCR, consensus, and verification core."""

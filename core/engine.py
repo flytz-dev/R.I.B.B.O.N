@@ -1,4 +1,4 @@
-"""PyConfer OCR engine.
+"""RIBBON OCR engine.
 
 The CLI and API share the same reference extraction, consensus, and audit stream.
 The engine is independent of persistence and HTTP interfaces."""
@@ -7,7 +7,11 @@ import base64
 import io
 import os
 import re
-from collections import Counter
+import shutil
+import threading
+import time
+from collections import Counter, deque
+from concurrent.futures import ThreadPoolExecutor
 
 import pdf2image
 import pypdf
@@ -21,12 +25,49 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PAYMENT_SLIPS_PATH = os.path.join(BASE_DIR, 'docs', 'payment_slips.pdf')
 REFERENCE_PDF_PATH = os.path.join(BASE_DIR, 'docs', 'reference.pdf')
 
-# Override tool locations through environment variables or configure_paths.
-TESSERACT_PATH = os.environ.get('TESSERACT_CMD', r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-POPPLER_PATH = os.environ.get('POPPLER_PATH', r"C:\poppler\Library\bin")
+# Default Windows installer locations, used only when nothing better is available.
+_WINDOWS_TESSERACT = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_WINDOWS_POPPLER = r"C:\poppler\Library\bin"
+
+
+def default_tesseract_path() -> str:
+    """Prefer TESSERACT_CMD, then PATH, then the default Windows installer location."""
+    configured = os.environ.get('TESSERACT_CMD')
+    if configured:
+        return configured
+    found = shutil.which('tesseract')
+    if found:
+        return found
+    return _WINDOWS_TESSERACT if os.path.isfile(_WINDOWS_TESSERACT) else 'tesseract'
+
+
+def default_poppler_path() -> str:
+    """Prefer POPPLER_PATH; an empty value lets pdf2image search PATH."""
+    configured = os.environ.get('POPPLER_PATH')
+    if configured:
+        return configured
+    if shutil.which('pdftoppm'):
+        return ''
+    return _WINDOWS_POPPLER if os.path.isdir(_WINDOWS_POPPLER) else ''
+
+
+TESSERACT_PATH = default_tesseract_path()
+POPPLER_PATH = default_poppler_path()
 
 DEFAULT_DPI = 500
 TESSERACT_CONFIG = r'--psm 6 -c tessedit_char_whitelist=0123456789,. -c classify_bln_numeric_mode=1 -c tessedit_char_blacklist=IlOo'
+
+# Pages are read in parallel by a pool shared across audits, so concurrent users
+# divide the same CPU budget instead of each starting their own workers.
+# PYCONFER_OCR_WORKERS, from the project's first name, is still accepted.
+OCR_WORKERS = max(1, int(
+    os.environ.get('RIBBON_OCR_WORKERS') or os.environ.get('PYCONFER_OCR_WORKERS')
+    or min(4, max(1, (os.cpu_count() or 2) // 2))
+))
+
+# Each Tesseract process would otherwise start one OpenMP thread per core, which
+# oversubscribes the CPU once several pages are read at the same time.
+os.environ.setdefault('OMP_THREAD_LIMIT', '1')
 
 
 def configure_paths(tess_path: str, poppler_bin: str):
@@ -104,22 +145,52 @@ def normalize_amount(extracted_text: str):
     return None
 
 
+def _confidence(value):
+    """Convert a Tesseract word confidence (0-100, or -1 for non-words) to an integer."""
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(confidence) if confidence >= 0 else None
+
+
 def extract_image_fields(img_param):
-    """Extract a registration code and amount using Tesseract."""
-    result = {"code": None, "amount": None}
+    """Extract the registration code and amount with Tesseract.
+
+    A single image_to_data call returns the text, each word's confidence, and its
+    location, so previews no longer need a second OCR pass to find the fields."""
+    result = {
+        "code": None, "amount": None,
+        "code_conf": None, "amount_conf": None,
+        "code_box": None, "amount_box": None,
+    }
 
     try:
-        text = pytesseract.image_to_string(img_param, lang='eng', config=TESSERACT_CONFIG)
-        code_match = re.search(r'\b\d{16}\b', text)
-        if code_match:
-            extracted_code = str(int(code_match.group(0)))
-            if 4 <= len(extracted_code) <= 6 and extracted_code.endswith('0'):
-                result["code"] = extracted_code
-
-        amount = normalize_amount(text)
-        if amount: result["amount"] = amount
+        data = pytesseract.image_to_data(
+            img_param, lang='eng', config=TESSERACT_CONFIG, output_type=pytesseract.Output.DICT
+        )
     except Exception:
-        pass
+        return result
+
+    for k, word in enumerate(data.get("text", [])):
+        word = (word or "").strip()
+        if not word:
+            continue
+        box = (data["left"][k], data["top"][k],
+               data["left"][k] + data["width"][k], data["top"][k] + data["height"][k])
+
+        if result["code"] is None:
+            code_match = re.search(r'\b\d{16}\b', word)
+            if code_match:
+                extracted_code = str(int(code_match.group(0)))
+                if 4 <= len(extracted_code) <= 6 and extracted_code.endswith('0'):
+                    result.update(code=extracted_code, code_conf=_confidence(data["conf"][k]), code_box=box)
+                continue
+
+        if result["amount"] is None:
+            amount = normalize_amount(word)
+            if amount:
+                result.update(amount=amount, amount_conf=_confidence(data["conf"][k]), amount_box=box)
     return result
 
 
@@ -139,98 +210,171 @@ STRATEGIES = [
     ("8. Thicken", lambda img: img.filter(ImageFilter.MinFilter(3)).point(lambda x: 0 if x < 140 else 255, '1')),
 ]
 
+# Sentinel readings representing missing OCR data.
+EMPTY_CODE = "0"
+EMPTY_AMOUNT = "0,00"
 
-def process_page_with_consensus(img_gray, expected_code, expected_amount):
-    """Vote across eight image strategies when the first reading differs.
 
-    Track the strategy producing each winning field to locate its visual evidence."""
+def _read_with_strategy(img_gray, index):
+    """Apply one strategy and map the field locations back to the original page."""
+    processed_image = STRATEGIES[index][1](img_gray)
+    fields = extract_image_fields(processed_image)
+    factor = img_gray.width / processed_image.width
+    for key in ("code_box", "amount_box"):
+        if fields.get(key):
+            fields[key] = tuple(v * factor for v in fields[key])
+    return fields
 
-    # Track the first strategy producing each candidate field.
-    code_sources, amount_sources = {}, {}
 
-    # Try the default strategy first.
-    initial_image = STRATEGIES[0][1](img_gray)
-    initial_reading = extract_image_fields(initial_image)
+def vote_readings(readings):
+    """Choose the most frequent nonempty code and amount independently.
 
-    final_code = initial_reading["code"]
-    final_amount = initial_reading["amount"]
-    if final_code: code_sources.setdefault(final_code, 0)
-    if final_amount: amount_sources.setdefault(final_amount, 0)
+    readings is a list of (strategy index, fields). Votes count the strategies that
+    agree with the winner; confidence averages Tesseract's score across them."""
+    result = {"strategies_run": len(readings)}
+    for field, empty in (("code", EMPTY_CODE), ("amount", EMPTY_AMOUNT)):
+        candidates = [(index, fields) for index, fields in readings if fields.get(field)]
+        if not candidates:
+            result.update({
+                field: empty, f"{field}_votes": 0, f"{field}_strategy": None,
+                f"{field}_conf": None, f"{field}_box": None,
+            })
+            continue
 
-    # Run the remaining strategies only when the first reading differs.
-    if not (final_code == expected_code and final_amount == expected_amount):
-        code_candidates, amount_candidates = [], []
-        if final_code: code_candidates.append(final_code)
-        if final_amount: amount_candidates.append(final_amount)
+        winner, votes = Counter(fields[field] for _index, fields in candidates).most_common(1)[0]
+        supporters = [(index, fields) for index, fields in candidates if fields[field] == winner]
+        confidences = [fields[f"{field}_conf"] for _index, fields in supporters
+                       if fields.get(f"{field}_conf") is not None]
+        source_index, source = supporters[0]
+        result.update({
+            field: winner,
+            f"{field}_votes": votes,
+            f"{field}_strategy": source_index,
+            f"{field}_conf": round(sum(confidences) / len(confidences)) if confidences else None,
+            f"{field}_box": source.get(f"{field}_box"),
+        })
+    return result
 
-        for index, (name, apply_filter) in enumerate(STRATEGIES[1:], start=1):
+
+def read_page(img_gray, is_known):
+    """Read a page, voting across eight image strategies when needed.
+
+    The first strategy is accepted when its code and amount form a pair present in
+    the reference list (is_known). Otherwise the remaining strategies run and vote.
+    The check does not depend on which slip is expected next, so pages can be read
+    in parallel and matched to the reference afterwards, in order."""
+    readings = [(0, _read_with_strategy(img_gray, 0))]
+    first = readings[0][1]
+
+    if not (first.get("code") and first.get("amount") and is_known(first["code"], first["amount"])):
+        for index in range(1, len(STRATEGIES)):
             try:
-                processed_image = apply_filter(img_gray)
-                readings = extract_image_fields(processed_image)
-                if readings["code"]:
-                    code_candidates.append(readings["code"])
-                    code_sources.setdefault(readings["code"], index)
-                if readings["amount"]:
-                    amount_candidates.append(readings["amount"])
-                    amount_sources.setdefault(readings["amount"], index)
+                readings.append((index, _read_with_strategy(img_gray, index)))
             except Exception:
                 pass
 
-        final_code = Counter(code_candidates).most_common(1)[0][0] if code_candidates else "0"
-        final_amount = Counter(amount_candidates).most_common(1)[0][0] if amount_candidates else "0,00"
-
-    code_check = code_status(final_code, expected_code)
-    amount_check = "OK" if final_amount == expected_amount else "MISMATCH"
-    overall_status = "ERROR" if (code_check != "OK" or amount_check != "OK") else "OK"
-    if expected_code == "N/A": overall_status = "END OF LIST"
-
-    return {
-        "code": final_code,
-        "amount": final_amount,
-        "code_status": code_check,
-        "amount_status": amount_check,
-        "overall_status": overall_status,
-        "code_strategy": code_sources.get(final_code),
-        "amount_strategy": amount_sources.get(final_amount),
-    }
+    return vote_readings(readings)
 
 
 # ==========================================
-# Locate and highlight OCR evidence
+# Matching pages to the reference list
 # ==========================================
 
-def _matches(word: str, target: str, field_type: str) -> bool:
-    """Check whether a Tesseract word matches the extracted field."""
-    if field_type == "code":
-        # Compare the 16-digit numeric line after removing leading zeros.
-        digits = re.sub(r'\D', '', word)
-        if not digits: return False
-        try:
-            return str(int(digits)) == target
-        except ValueError:
-            return False
-    return normalize_amount(word) == target
+MATCHED_BY_CODE = "CODE"
+MATCHED_BY_POSITION = "POSITION"
+MATCHED_DUPLICATE = "DUPLICATE"
 
 
-def find_bounding_box(img, target: str, field_type: str):
-    """Return the target bounding box (x0, y0, x1, y1), or None."""
-    if not target or target in ("0", "0,00", "N/A"):
+class ReferenceMatcher:
+    """Pair each slip with a reference entry by registration code, in page order.
+
+    A slip whose code appears in the list is paired with that entry, wherever it is,
+    so a missing, extra, or out-of-order slip no longer shifts every following page.
+    When the code is unreadable or absent from the list, the slip falls back to the
+    next unused entry after the last pairing: the position where it was expected.
+    Each entry is used once; entries never paired are reported as missing slips."""
+
+    def __init__(self, entries):
+        self.entries = entries
+        self.used = [False] * len(entries)
+        self.cursor = 0
+        self._by_suffix = {}
+        self._pairs = set()
+        for index, entry in enumerate(entries):
+            suffix = self._suffix(entry["code"])
+            if suffix:
+                self._by_suffix.setdefault(suffix, []).append(index)
+                self._pairs.add((suffix, entry["amount"]))
+
+    @staticmethod
+    def _suffix(code):
+        return _comparable_suffix(code) if code and code != "N/A" else ""
+
+    def _matchable(self, index):
+        return not self.used[index] and bool(self._suffix(self.entries[index]["code"]))
+
+    def is_known(self, code, amount):
+        """Whether a code and amount pair appears in the list. Stateless and thread-safe."""
+        return (self._suffix(code), amount) in self._pairs
+
+    def _next_unused(self, start):
+        for index in range(start, len(self.entries)):
+            if self._matchable(index):
+                return index
         return None
-    try:
-        data = pytesseract.image_to_data(
-            img, lang='eng', config=TESSERACT_CONFIG, output_type=pytesseract.Output.DICT
-        )
-    except Exception:
-        return None
 
-    for k, word in enumerate(data.get("text", [])):
-        word = (word or "").strip()
-        if not word:
-            continue
-        if _matches(word, target, field_type):
-            x, y = data["left"][k], data["top"][k]
-            return (x, y, x + data["width"][k], y + data["height"][k])
-    return None
+    def _take(self, index):
+        self.used[index] = True
+        self.cursor = index + 1
+
+    def match(self, code):
+        """Return (entry index or None, how it was matched)."""
+        candidates = self._by_suffix.get(self._suffix(code), [])
+        unused = [index for index in candidates if not self.used[index]]
+        if unused:
+            # With repeated codes, prefer the next occurrence after the last pairing.
+            ahead = [index for index in unused if index >= self.cursor]
+            index = ahead[0] if ahead else unused[0]
+            self._take(index)
+            return index, MATCHED_BY_CODE
+        if candidates:
+            # Every entry with this code was already paired: the slip is a repeat.
+            return candidates[0], MATCHED_DUPLICATE
+
+        index = self._next_unused(self.cursor)
+        if index is None:
+            index = self._next_unused(0)
+        if index is None:
+            return None, MATCHED_BY_POSITION
+        self._take(index)
+        return index, MATCHED_BY_POSITION
+
+    def missing(self):
+        """Entries that no slip was paired with."""
+        return [
+            {"line": index + 1, "code": entry["code"], "amount": entry["amount"]}
+            for index, entry in enumerate(self.entries)
+            if self._matchable(index)
+        ]
+
+
+def compare_reading(reading, entry, matched_by):
+    """Compare a reading with its paired entry and return code, amount, and overall status."""
+    if entry is None:
+        return "MISMATCH", "MISMATCH", "END OF LIST"
+
+    code_check = code_status(reading["code"], entry["code"])
+    amount_check = "OK" if reading["amount"] == entry["amount"] else "MISMATCH"
+    mismatch = code_check != "OK" or amount_check != "OK" or matched_by == MATCHED_DUPLICATE
+    return code_check, amount_check, "ERROR" if mismatch else "OK"
+
+
+# ==========================================
+# Highlight OCR evidence
+# ==========================================
+
+CODE_COLOR = "#2563eb"
+AMOUNT_COLOR = "#16a34a"
 
 
 def _scale_box(box, scale):
@@ -247,27 +391,13 @@ def _pad_box(box, factor=0.45, minimum=4.0):
 def generate_annotated_image(img_gray, result, max_width=1400):
     """Highlight the extracted fields on the original page.
 
-    Locate each field using its winning image strategy, then map the coordinates
-    back to the original image so the preview remains readable."""
+    Field locations come from the OCR reading itself, already mapped back to the
+    original page, so the preview costs no additional Tesseract call."""
     highlights = []
-    for field_type, strategy_key, color in (
-        ("code", "code_strategy", "#2563eb"),
-        ("amount", "amount_strategy", "#16a34a"),
-    ):
-        target = result.get(field_type)
-        index = result.get(strategy_key)
-        if not target or index is None:
-            continue
-        try:
-            strategy_image = STRATEGIES[index][1](img_gray)
-        except Exception:
-            continue
-        box = find_bounding_box(strategy_image, target, field_type)
-        if not box:
-            continue
-        # Map the strategy coordinates back to the original image.
-        factor = img_gray.width / strategy_image.width
-        highlights.append((_pad_box(tuple(v * factor for v in box)), color, STRATEGIES[index][0]))
+    for field_type, color in (("code", CODE_COLOR), ("amount", AMOUNT_COLOR)):
+        box = result.get(f"{field_type}_box")
+        if box:
+            highlights.append((_pad_box(box), color))
 
     scale = min(1.0, max_width / img_gray.width)
     preview = img_gray.convert("RGB")
@@ -276,15 +406,15 @@ def generate_annotated_image(img_gray, result, max_width=1400):
 
     drawing = ImageDraw.Draw(preview)
     thickness = max(2, preview.width // 500)
-    for box, color, _name in highlights:
+    for box, color in highlights:
         drawing.rectangle(_scale_box(box, scale), outline=color, width=thickness)
 
     buffer = io.BytesIO()
     preview.save(buffer, format="JPEG", quality=70, optimize=True)
     return {
         "image": "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii"),
-        "code_found": any(c == "#2563eb" for _b, c, _n in highlights),
-        "amount_found": any(c == "#16a34a" for _b, c, _n in highlights),
+        "code_found": any(color == CODE_COLOR for _box, color in highlights),
+        "amount_found": any(color == AMOUNT_COLOR for _box, color in highlights),
     }
 
 
@@ -293,35 +423,44 @@ def generate_annotated_image(img_gray, result, max_width=1400):
 # ==========================================
 
 REPORT_COLUMNS = [
-    "Page", "Code (Reference PDF)", "Code (OCR Slips)", "Code Status",
+    "Page", "Reference Line", "Code (Reference PDF)", "Code (OCR Slips)", "Code Status",
     "Amount (Reference PDF)", "Amount (OCR Slips)", "Amount Status", "Overall Status",
-    "Category",
+    "Category", "Matched By", "Code Confidence", "Amount Confidence",
+    "Code Votes", "Amount Votes", "Strategies Run", "Render ms", "OCR ms", "Review",
 ]
 
 # Discrepancy categories for human review.
-CATEGORY_OTHER_REGISTRATION = "OTHER REGISTRATION"
+CATEGORY_DUPLICATE = "DUPLICATE"
+CATEGORY_LIKELY_MISREAD = "LIKELY MISREAD"
 CATEGORY_UNREAD = "UNREAD"
 CATEGORY_REVIEW = "REVIEW"
+# Produced by releases that matched slips by position only; kept to display old reports.
+CATEGORY_OTHER_REGISTRATION = "OTHER REGISTRATION"
 
-# Sentinel readings representing missing OCR data.
-_EMPTY_CODE_READINGS = {"", "0", None}
-_EMPTY_AMOUNT_READINGS = {"", "0,00", None}
+# Status of reference entries that no slip was paired with.
+STATUS_MISSING_SLIP = "MISSING SLIP"
+
+_EMPTY_CODE_READINGS = {"", EMPTY_CODE, None}
+_EMPTY_AMOUNT_READINGS = {"", EMPTY_AMOUNT, None}
 
 
-def classify_discrepancy(result, known_registrations):
-    """Classify mismatches as another registration, unread data, or manual review.
+def classify_discrepancy(result, matched_by):
+    """Classify a mismatch to prioritize human review.
 
-    Categories prioritize inspection; they cannot distinguish OCR errors from
-    genuine document discrepancies without human review."""
+    LIKELY MISREAD covers a code found nowhere in the list while the amount matches
+    the slip expected at that position: the code was probably misread. Categories
+    cannot prove whether the OCR or the document is wrong; the reviewer decides."""
     if result["overall_status"] != "ERROR":
         return ""
 
+    if matched_by == MATCHED_DUPLICATE:
+        return CATEGORY_DUPLICATE
+
     if result["code_status"] != "OK":
-        code = result["code"]
-        if code in _EMPTY_CODE_READINGS:
+        if result["code"] in _EMPTY_CODE_READINGS:
             return CATEGORY_UNREAD
-        if code in known_registrations:
-            return CATEGORY_OTHER_REGISTRATION
+        if matched_by == MATCHED_BY_POSITION and result["amount_status"] == "OK":
+            return CATEGORY_LIKELY_MISREAD
         return CATEGORY_REVIEW
 
     if result["amount"] in _EMPTY_AMOUNT_READINGS:
@@ -329,15 +468,90 @@ def classify_discrepancy(result, known_registrations):
     return CATEGORY_REVIEW
 
 
+def missing_report_rows(missing):
+    """Represent reference entries without a slip as report rows for CSV export."""
+    return [
+        {
+            "Page": None,
+            "Reference Line": entry["line"],
+            "Code (Reference PDF)": entry["code"],
+            "Amount (Reference PDF)": entry["amount"],
+            "Overall Status": STATUS_MISSING_SLIP,
+        }
+        for entry in missing
+    ]
+
+
 def _poppler_kwargs():
     # Without a configured directory, pdf2image searches PATH.
     return {"poppler_path": POPPLER_PATH} if (POPPLER_PATH and os.path.isdir(POPPLER_PATH)) else {}
 
 
+_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def _ocr_pool():
+    global _POOL
+    with _POOL_LOCK:
+        if _POOL is None:
+            _POOL = ThreadPoolExecutor(max_workers=OCR_WORKERS, thread_name_prefix="ribbon-ocr")
+        return _POOL
+
+
+def _process_page(payment_slips_path, number, dpi, is_known, include_image):
+    """Render and read one page; runs on a pool worker."""
+    started = time.perf_counter()
+    pages = pdf2image.convert_from_path(
+        payment_slips_path, dpi=dpi, first_page=number, last_page=number, **_poppler_kwargs()
+    )
+    if not pages:
+        return None
+    rendered = time.perf_counter()
+
+    img_gray = pages[0].convert('L')
+    reading = read_page(img_gray, is_known)
+    finished = time.perf_counter()
+
+    page = {
+        "number": number,
+        "reading": reading,
+        "render_ms": round((rendered - started) * 1000),
+        "ocr_ms": round((finished - rendered) * 1000),
+        "preview": None,
+    }
+    if include_image:
+        try:
+            page["preview"] = generate_annotated_image(img_gray, reading)
+        except Exception as e:
+            page["preview"] = {"image_error": str(e)}
+    return page
+
+
+def _process_pages(payment_slips_path, total_pages, dpi, is_known, include_image):
+    """Yield processed pages in order while pool workers read the following pages."""
+    lookahead = OCR_WORKERS * 2
+    pending = deque()
+    next_page = 1
+    try:
+        while pending or next_page <= total_pages:
+            while next_page <= total_pages and len(pending) < lookahead:
+                pending.append(_ocr_pool().submit(
+                    _process_page, payment_slips_path, next_page, dpi, is_known, include_image
+                ))
+                next_page += 1
+            yield pending.popleft().result()
+    finally:
+        # Abandoned audits release queued pages; pages already being read finish and are dropped.
+        for future in pending:
+            future.cancel()
+
+
 def stream_audit(payment_slips_path, reference_path, dpi=DEFAULT_DPI, include_image=True):
-    """Yield start, page, and end events while rendering one PDF page at a time."""
+    """Yield start, page, and end events, reading pages in parallel and reporting them in order."""
+    started = time.perf_counter()
     reference_list = extract_reference_list(reference_path)
-    known_registrations = {item["code"] for item in reference_list if item["code"] != "N/A"}
+    matcher = ReferenceMatcher(reference_list)
 
     info = pdf2image.pdfinfo_from_path(payment_slips_path, **_poppler_kwargs())
     total_pages = info["Pages"]
@@ -347,50 +561,64 @@ def stream_audit(payment_slips_path, reference_path, dpi=DEFAULT_DPI, include_im
         "total_pages": total_pages,
         "reference_count": len(reference_list),
         "dpi": dpi,
+        "workers": OCR_WORKERS,
     }
 
-    for number in range(1, total_pages + 1):
-        print(f"Processing page {number}...")
-        pages = pdf2image.convert_from_path(
-            payment_slips_path, dpi=dpi, first_page=number, last_page=number, **_poppler_kwargs()
-        )
-        if not pages:
+    for page in _process_pages(payment_slips_path, total_pages, dpi, matcher.is_known, include_image):
+        if page is None:
             continue
+        number = page["number"]
+        reading = page["reading"]
 
-        index = number - 1
-        expected_entry = reference_list[index] if (reference_list and index < len(reference_list)) else {"code": "N/A", "amount": "N/A"}
+        index, matched_by = matcher.match(reading["code"])
+        entry = reference_list[index] if index is not None else None
+        code_check, amount_check, overall_status = compare_reading(reading, entry, matched_by)
+        result = {**reading, "code_status": code_check, "amount_status": amount_check,
+                  "overall_status": overall_status}
+        category = classify_discrepancy(result, matched_by)
 
-        img_gray = pages[0].convert('L')
-        result = process_page_with_consensus(img_gray, expected_entry["code"], expected_entry["amount"])
-        category = classify_discrepancy(result, known_registrations)
-
-        if result["overall_status"] == "ERROR":
-            print(f"   [MISMATCH/{category}] Page {number} | Expected: {expected_entry['code']} - {expected_entry['amount']} | Read: {result['code']} - {result['amount']}")
+        expected_code = entry["code"] if entry else "N/A"
+        expected_amount = entry["amount"] if entry else "N/A"
+        if overall_status == "ERROR":
+            print(f"   [MISMATCH/{category}] Page {number} | Expected: {expected_code} - {expected_amount} | Read: {reading['code']} - {reading['amount']}")
 
         row = {
             "Page": number,
-            "Code (Reference PDF)": expected_entry["code"],
-            "Code (OCR Slips)": result["code"],
-            "Code Status": result["code_status"],
-            "Amount (Reference PDF)": expected_entry["amount"],
-            "Amount (OCR Slips)": result["amount"],
-            "Amount Status": result["amount_status"],
-            "Overall Status": result["overall_status"],
+            "Reference Line": index + 1 if index is not None else None,
+            "Code (Reference PDF)": expected_code,
+            "Code (OCR Slips)": reading["code"],
+            "Code Status": code_check,
+            "Amount (Reference PDF)": expected_amount,
+            "Amount (OCR Slips)": reading["amount"],
+            "Amount Status": amount_check,
+            "Overall Status": overall_status,
             "Category": category,
+            "Matched By": matched_by,
+            "Code Confidence": reading.get("code_conf"),
+            "Amount Confidence": reading.get("amount_conf"),
+            "Code Votes": reading.get("code_votes"),
+            "Amount Votes": reading.get("amount_votes"),
+            "Strategies Run": reading.get("strategies_run"),
+            "Render ms": page["render_ms"],
+            "OCR ms": page["ocr_ms"],
+            "Review": "",
         }
 
         event = {"type": "page", "page": number, "total_pages": total_pages, "row": row}
 
         if include_image:
-            strategy_index = result.get("code_strategy")
+            strategy_index = reading.get("code_strategy")
             if strategy_index is None:
-                strategy_index = result.get("amount_strategy")
+                strategy_index = reading.get("amount_strategy")
             event["strategy"] = STRATEGIES[strategy_index][0] if strategy_index is not None else None
-            try:
-                event.update(generate_annotated_image(img_gray, result))
-            except Exception as e:
-                event["image_error"] = str(e)
+            event.update(page["preview"] or {})
 
         yield event
 
-    yield {"type": "end", "total_pages": total_pages, "model": "Tesseract OCR"}
+    yield {
+        "type": "end",
+        "total_pages": total_pages,
+        "model": "Tesseract OCR",
+        "elapsed_seconds": round(time.perf_counter() - started, 2),
+        "missing": matcher.missing(),
+    }
