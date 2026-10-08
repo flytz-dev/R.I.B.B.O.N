@@ -1,16 +1,25 @@
-# Contributing to PyConfer
+# Contributing to RIBBON
 
 This guide describes the team's responsibilities, contribution workflow, and roadmap. The API's JSON contract connects the workstreams so each contributor can make progress without waiting for every other component.
 
 ## Current project stage
 
-The first implementation phase provides a verification engine, a REST API, SQLite history, and a working web interface. The prototype processes batches, streams page results, highlights OCR evidence, classifies discrepancies, and exports reports. The current interface also shows active resolution and elapsed reading time. Automated tests cover engine rules, API behavior, and persistence.
+The first implementation phase provides a verification engine, a REST API, SQLite history, and a working web interface. The prototype processes batches, streams page results, highlights OCR evidence, classifies discrepancies, and exports reports. Automated tests cover engine rules, API behavior, persistence, and the browser script.
 
-PyConfer currently runs locally for a single user. Authentication, user-specific access, shared database infrastructure, and recorded review decisions remain future work. Establishing reliable verification is a prerequisite for expanding the prototype to team use.
+The second phase added, in a first form:
+
+- Sign-in with per-user audits, stored in the same local SQLite database.
+- Matching slips to the reference by registration code, with missing and duplicate slips reported.
+- Per-page timing, Tesseract confidence, and strategy agreement; parallel page reading.
+- Recorded reviewer verdicts (real discrepancy or OCR misread) and a metrics view by resolution.
+- A benchmark tool that measures accuracy against a ground truth, with synthetic sample generation.
+- A **temporary** multi-user simulation for the thesis presentation, to be replaced by a real load test.
+
+Shared database infrastructure, roles and permissions beyond ownership, administrator-managed accounts, and a ground truth for real batches remain future work.
 
 ## Goal of the next phase
 
-**Make PyConfer collaborative.** This addresses the gap between the team platform described in the thesis and the current local prototype.
+**Make RIBBON collaborative.** This addresses the gap between the team platform described in the thesis and the current local prototype.
 
 This phase combines shared data storage, API authentication, and user-specific screens. The tasks below include starting points that can be pursued independently.
 
@@ -21,8 +30,8 @@ This phase combines shared data storage, API authentication, and user-specific s
 Own `core/`, `api/`, and the data contract consumed by the other workstreams. Coordinate changes to storage integration with the database contributor.
 
 - Implement check-digit validation for the payment slip's numeric line.
-- Add API authentication to support front-end login and sessions.
-- Define metrics endpoints for the future dashboard.
+- Build a ground truth for a real batch and run `python -m tools.benchmark` at each resolution; choose the default DPI from those results.
+- Replace the temporary simulation (`api/simulation.py`) with a load test run outside the application.
 - Compare automated verification with manual checking to evaluate the thesis's overall objective.
 
 When another workstream needs a new field or behavior, coordinate the contract with the engine/API owner before modifying these components.
@@ -32,7 +41,7 @@ When another workstream needs a new field or behavior, coordinate the contract w
 The current database has two tables and stores audit history only.
 
 - Plan migration to PostgreSQL or MySQL for the proposed shared deployment, consistent with the database architecture discussed in Chapter 2.
-- Model users and permissions: who ran each audit and who may access its results.
+- Extend the current model (`app_user`, `session`, and `audit.owner`) with roles and shared access: who ran each audit and who may access its results.
 - Persist the reference list, which is currently extracted for each run and discarded.
 - Design queries for metrics by batch, operator, and time period. Distinguish agreement with the reference from measured OCR accuracy against reviewed data.
 - Define retention and backup policies for taxpayer information.
@@ -43,9 +52,8 @@ The current database has two tables and stores audit history only.
 
 The current interface uses plain JavaScript, with no framework or build step. It provides a foundation for the next phase.
 
-- Design login and session handling.
-- Build a metrics dashboard for conformity over time and batches with discrepancies.
-- Add a review workflow for recording decisions and comments; the current interface does not persist the operator's review.
+- Extend the metrics view with conformity over time and batches with discrepancies.
+- Extend the review workflow with comments and corrected values; the interface currently records only the verdict.
 - Evaluate React, Vue, or continued use of plain JavaScript. Record the rationale for the thesis rather than treating a framework migration as a requirement.
 
 **Starting point:** sketch the new screens and list the data each needs. Agree on the required API contract before implementing dependent integrations.
@@ -86,13 +94,14 @@ Historical reports currently contain no annotated images. Features requiring lat
 ## Documentation conventions
 
 - Write repository documentation in English.
-- Use English for identifiers, comments, docstrings, API fields, and interface labels. Legacy database literals in the migration layer are the compatibility exception.
+- Use English for identifiers, comments, docstrings, API fields, and report labels. Legacy database literals in the migration layer are the compatibility exception.
+- Write the web interface's visible text in Portuguese. The interface translates API values and error messages for display; add a translation in `static/app.js` when the API gains a message the interface shows.
 - Separate implemented features from planned work.
 - Update setup instructions and API documentation when behavior changes.
-- State the dataset, resolution, method, and limitations behind accuracy or timing claims. The browser timer alone is not a controlled OCR benchmark.
+- State the dataset, resolution, method, and limitations behind accuracy or timing claims. The browser timer alone is not a controlled OCR benchmark; use `tools/benchmark.py`, and say when results come from synthetic slips.
 
 ## Local execution and data handling
 
 Each contributor clones the project and runs it locally. Working PDFs contain confidential taxpayer information and are excluded from version control. Do not commit them or send them to external services. Use synthetic data for public examples, screenshots, and tests.
 
-The planned collaborative phase should preserve this data-handling constraint using infrastructure controlled by the team. Authentication, permissions, and retention must be designed before extending access beyond the local prototype.
+The collaborative phase should preserve this data-handling constraint using infrastructure controlled by the team. Sign-in now separates users' audits, but registration is open and there are no roles or HTTPS; permissions and retention must be designed before extending access beyond a trusted local network.

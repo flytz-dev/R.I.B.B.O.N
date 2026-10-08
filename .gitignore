@@ -53,3 +53,6 @@ pyconfer.db-shm
 backups/
 testee/
 Pictures/
+
+# Tools and packages copied by prepare-usb.bat
+vendor/

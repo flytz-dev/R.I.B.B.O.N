@@ -86,3 +86,31 @@ def test_conflicting_schema_rolls_back_partial_renames(legacy_database):
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert tables == {"auditoria", "pagina", "page"}
         assert connection.execute("SELECT status FROM auditoria WHERE job_id = 'saved'").fetchone()[0] == "concluida"
+
+
+def test_previous_english_schema_gains_metrics_and_ownership(tmp_path, monkeypatch):
+    """Databases from the first English release keep their rows and gain the new columns."""
+    path = tmp_path / "v1.db"
+    monkeypatch.setattr(storage, "DATABASE_PATH", str(path))
+    with sqlite3.connect(path) as connection:
+        connection.executescript("""
+            CREATE TABLE audit (
+                job_id TEXT PRIMARY KEY, created_at TEXT NOT NULL, status TEXT NOT NULL, dpi INTEGER,
+                payment_slips_file TEXT, reference_file TEXT, total_pages INTEGER
+            );
+            CREATE TABLE page (
+                job_id TEXT NOT NULL REFERENCES audit(job_id) ON DELETE CASCADE, page INTEGER NOT NULL,
+                reference_code TEXT, ocr_code TEXT, code_status TEXT, reference_amount TEXT, ocr_amount TEXT,
+                amount_status TEXT, overall_status TEXT, category TEXT, PRIMARY KEY (job_id, page)
+            );
+            INSERT INTO audit VALUES ('old', '2026-09-30T10:00:00', 'completed', 500, 'b.pdf', 'c.pdf', 1);
+            INSERT INTO page VALUES ('old', 1, '113640', '113640', 'OK', '76,82', '76,82', 'OK', 'OK', '');
+        """)
+
+    storage.create_schema()
+
+    row = storage.load_report("old")[0]
+    assert row["Overall Status"] == "OK"
+    assert row["OCR ms"] is None and row["Review"] == ""
+    assert storage.load_summary("old")["owner"] is None
+    assert [item["job_id"] for item in storage.list_audits(owner="anyone")] == ["old"]

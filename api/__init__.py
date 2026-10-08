@@ -1,1 +1,1 @@
-"""PyConfer REST API package."""
+"""RIBBON REST API package."""

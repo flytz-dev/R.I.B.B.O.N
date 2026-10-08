@@ -9,7 +9,7 @@ pandas==3.0.5
 fastapi==0.121.2
 uvicorn==0.41.0
 python-multipart==0.0.20
+httpx==0.28.1  # HTTP client for the temporary multi-user simulation and FastAPI TestClient
 
 # Tests (run with: python -m pytest)
 pytest==9.1.1
-httpx==0.28.1  # required by FastAPI TestClient
